@@ -5,10 +5,11 @@ import {
 	T,
 	createShapeId,
 	type TLBaseShape,
+	type TLComponents,
 	useEditor,
 } from "tldraw";
 import "tldraw/tldraw.css";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 // Map a child window (iframe contentWindow) back to the shape id that hosts it
 const contentWindowToShapeId = new Map<Window, string>();
@@ -245,7 +246,7 @@ class IframeShapeUtil extends BaseBoxShapeUtil<IframeShape> {
 		return {
 			w: IFRAME_W,
 			h: IFRAME_H,
-			url: `${baseUrl}/m?path=/wiki/The_Simpsons`,
+			url: `${baseUrl}/m?path=/wiki/Iannis_Xenakis`,
 		};
 	}
 
@@ -925,6 +926,30 @@ function WikipediaSearchBar({
 
 export default function App() {
 	const editorRef = useRef<any>(null);
+	const minimalComponents = useMemo<TLComponents>(
+		() => ({
+			Toolbar: null,
+			StylePanel: null,
+			NavigationPanel: null,
+			HelperButtons: null,
+			Minimap: null,
+			ZoomMenu: null,
+			ActionsMenu: null,
+			QuickActions: null,
+			PageMenu: null,
+			SharePanel: null,
+			TopPanel: null,
+			CursorChatBubble: null,
+			FollowingIndicator: null,
+			RichTextToolbar: null,
+			ImageToolbar: null,
+			VideoToolbar: null,
+			HelpMenu: null,
+			DebugPanel: null,
+			DebugMenu: null,
+		}),
+		[]
+	);
 
 	// Add this function to find an empty space and create a new iframe
 	const createIframeInEmptySpace = (url: string) => {
@@ -944,43 +969,214 @@ export default function App() {
 			h: shape.props?.h ?? IFRAME_H,
 		});
 
-		// Compute the rightmost edge among existing iframes
-		let rightmostEdge = 200 + IFRAME_W; // default if none found
-		if (all.length > 0) {
-			rightmostEdge = Math.max(
-				...all.map((sh: any) => {
-					const b = getBounds(sh);
-					return b.x + b.w;
-				})
+		const container = document.querySelector(
+			".tl-container"
+		) as HTMLElement | null;
+
+		const toPagePoint = (pt: { x: number; y: number }) => {
+			try {
+				if (typeof (editor as any).screenToPage === "function") {
+					return (editor as any).screenToPage(pt);
+				}
+			} catch {}
+			const rect = container?.getBoundingClientRect();
+			const cam = (editor as any).getCamera
+				? (editor as any).getCamera()
+				: { x: 0, y: 0, z: (editor as any).getZoomLevel?.() ?? 1 };
+			const z =
+				cam && typeof cam.z === "number"
+					? cam.z
+					: (editor as any).getZoomLevel?.() ?? 1;
+			const pageX = rect
+				? (pt.x - rect.left) / z + (cam?.x ?? 0)
+				: pt.x / z + (cam?.x ?? 0);
+			const pageY = rect
+				? (pt.y - rect.top) / z + (cam?.y ?? 0)
+				: pt.y / z + (cam?.y ?? 0);
+			return { x: pageX, y: pageY };
+		};
+
+		const viewportBounds = (() => {
+			if (!container) return null;
+			const rect = container.getBoundingClientRect();
+			const topLeft = toPagePoint({ x: rect.left + 12, y: rect.top + 12 });
+			const bottomRight = toPagePoint({
+				x: rect.right - 12,
+				y: rect.bottom - 12,
+			});
+			return {
+				x: Math.min(topLeft.x, bottomRight.x),
+				y: Math.min(topLeft.y, bottomRight.y),
+				w: Math.abs(bottomRight.x - topLeft.x),
+				h: Math.abs(bottomRight.y - topLeft.y),
+			};
+		})();
+
+		const viewportCenter = viewportBounds
+			? {
+					x: viewportBounds.x + viewportBounds.w / 2,
+					y: viewportBounds.y + viewportBounds.h / 2,
+				}
+			: {
+					x: 200 + IFRAME_W / 2,
+					y: 200 + IFRAME_H / 2,
+				};
+
+		const intersects = (a: any, b: any) =>
+			a.x < b.x + b.w &&
+			a.x + a.w > b.x &&
+			a.y < b.y + b.h &&
+			a.y + a.h > b.y;
+
+		const visibleFrames =
+			viewportBounds === null
+				? []
+				: all.filter((sh: any) => intersects(getBounds(sh), viewportBounds));
+
+		const clusterBox = visibleFrames.reduce(
+			(acc: any, sh: any) => {
+				const b = getBounds(sh);
+				return {
+					minX: Math.min(acc.minX, b.x),
+					maxX: Math.max(acc.maxX, b.x + b.w),
+					minY: Math.min(acc.minY, b.y),
+					maxY: Math.max(acc.maxY, b.y + b.h),
+				};
+			},
+			{
+				minX: Infinity,
+				maxX: -Infinity,
+				minY: Infinity,
+				maxY: -Infinity,
+			}
+		);
+
+		const anchorPoint =
+			visibleFrames.length > 0
+				? {
+						x: (clusterBox.minX + clusterBox.maxX) / 2,
+						y: (clusterBox.minY + clusterBox.maxY) / 2,
+					}
+				: viewportCenter;
+
+		const clampToViewport = (pos: { x: number; y: number }) => {
+			if (!viewportBounds) return pos;
+			const maxX = viewportBounds.x + viewportBounds.w - IFRAME_W;
+			const maxY = viewportBounds.y + viewportBounds.h - IFRAME_H;
+			const minX = viewportBounds.x;
+			const minY = viewportBounds.y;
+			if (maxX <= minX || maxY <= minY) return pos;
+			return {
+				x: Math.min(Math.max(pos.x, minX), maxX),
+				y: Math.min(Math.max(pos.y, minY), maxY),
+			};
+		};
+
+		const isFree = (pos: { x: number; y: number }) => {
+			const bounds = { x: pos.x, y: pos.y, w: IFRAME_W, h: IFRAME_H };
+			return !all.some((sh: any) => {
+				const b = getBounds(sh);
+				return !(
+					bounds.x + bounds.w + GAP <= b.x ||
+					bounds.x >= b.x + b.w + GAP ||
+					bounds.y + bounds.h + GAP <= b.y ||
+					bounds.y >= b.y + b.h + GAP
+				);
+			});
+		};
+
+		const candidates: Array<{ x: number; y: number }> = [];
+		if (visibleFrames.length > 0) {
+			const clusterHeight = clusterBox.maxY - clusterBox.minY;
+			const centerAlignedY =
+				clusterHeight >= IFRAME_H
+					? clusterBox.minY + (clusterHeight - IFRAME_H) / 2
+					: clusterBox.minY;
+			candidates.push(
+				{ x: clusterBox.maxX + GAP, y: clusterBox.minY },
+				{ x: clusterBox.maxX + GAP, y: centerAlignedY },
+				{ x: clusterBox.minX - IFRAME_W - GAP, y: centerAlignedY }
 			);
 		}
 
-		// Start two columns to the right (leave one blank column for visual separation)
-		let x = Math.max(200, rightmostEdge + IFRAME_W + 2 * GAP);
-		const y = 200; // fixed row start for new search-created frames
+		const offsetStepX = IFRAME_W + GAP;
+		const offsetStepY = IFRAME_H + GAP;
+		const aroundAnchorOffsets = [
+			{ dx: 0, dy: 0 },
+			{ dx: offsetStepX, dy: 0 },
+			{ dx: -offsetStepX, dy: 0 },
+			{ dx: 0, dy: offsetStepY },
+			{ dx: 0, dy: -offsetStepY },
+			{ dx: offsetStepX, dy: offsetStepY },
+			{ dx: offsetStepX, dy: -offsetStepY },
+			{ dx: -offsetStepX, dy: offsetStepY },
+			{ dx: -offsetStepX, dy: -offsetStepY },
+		];
 
-		// Advance to the first empty column to the right if needed
-		const columnHasBlockers = (testX: number) => {
-			const colLeft = testX;
-			const colRight = testX + IFRAME_W;
-			return all
-				.map((sh: any) => getBounds(sh))
-				.some((b: any) => b.x < colRight && b.x + b.w > colLeft);
-		};
-
-		let guard = 0;
-		while (columnHasBlockers(x) && guard < 50) {
-			x += IFRAME_W + GAP;
-			guard++;
+		for (const { dx, dy } of aroundAnchorOffsets) {
+			candidates.push({
+				x: anchorPoint.x + dx - IFRAME_W / 2,
+				y: anchorPoint.y + dy - IFRAME_H / 2,
+			});
 		}
+
+		let chosen = null as null | { x: number; y: number };
+		for (const cand of candidates) {
+			const pos = clampToViewport(cand);
+			if (isFree(pos)) {
+				chosen = pos;
+				break;
+			}
+		}
+
+		if (!chosen) {
+			const centerCandidate = clampToViewport({
+				x: viewportCenter.x - IFRAME_W / 2,
+				y: viewportCenter.y - IFRAME_H / 2,
+			});
+			if (isFree(centerCandidate)) chosen = centerCandidate;
+		}
+
+		if (!chosen) {
+			// Fallback: place in the first open column to the right
+			let rightmostEdge = 200 + IFRAME_W; // default if none found
+			if (all.length > 0) {
+				rightmostEdge = Math.max(
+					...all.map((sh: any) => {
+						const b = getBounds(sh);
+						return b.x + b.w;
+					})
+				);
+			}
+
+			let x = Math.max(200, rightmostEdge + IFRAME_W + 2 * GAP);
+			let y = 200;
+
+			const columnHasBlockers = (testX: number) => {
+				const colLeft = testX;
+				const colRight = testX + IFRAME_W;
+				return all
+					.map((sh: any) => getBounds(sh))
+					.some((b: any) => b.x < colRight && b.x + b.w > colLeft);
+			};
+
+			let guard = 0;
+			while (columnHasBlockers(x) && guard < 50) {
+				x += IFRAME_W + GAP;
+				guard++;
+			}
+			chosen = { x, y };
+		}
+
+		if (!chosen) return;
 
 		// Create the new iframe
 		const newFrameId = createShapeId();
 		editor.createShape({
 			id: newFrameId,
 			type: "iframe",
-			x,
-			y,
+			x: chosen.x,
+			y: chosen.y,
 			props: { url, w: IFRAME_W, h: IFRAME_H },
 		});
 
@@ -988,7 +1184,7 @@ export default function App() {
 		scheduleNormalizeZOrder(editor);
 
 		// Zoom to the new frame
-		const b = { x, y, w: IFRAME_W, h: IFRAME_H };
+		const b = { x: chosen.x, y: chosen.y, w: IFRAME_W, h: IFRAME_H };
 		const currentZoom = editor.getZoomLevel ? editor.getZoomLevel() : 1;
 		const targetZoom = Math.min(Math.max(currentZoom, 0.5) * 1.12, 2);
 		// @ts-ignore
@@ -1216,10 +1412,16 @@ export default function App() {
 
 	return (
 		<div style={{ position: "fixed", inset: 0 }}>
+			<WikipediaSearchBar
+				baseUrl={baseUrl}
+				onSelectResult={(url) => createIframeInEmptySpace(url)}
+			/>
 			<Tldraw
 				licenseKey="tldraw-2026-01-06/WyJDQWNfSnlQRSIsWyIqIl0sMTYsIjIwMjYtMDEtMDYiXQ.jffxTKOc24XLz+ij+h5MATFy3tQb0YwQiZGh8Kjino9R1d6pkah7Wm/7Fudq4ac0ruj81ofGDy75u9gCl8OPCg"
 				persistenceKey="example"
 				shapeUtils={[IframeShapeUtil, WikiSearchShapeUtil]}
+				components={minimalComponents}
+				options={{ actionShortcutsLocation: "toolbar" }}
 				onMount={(editor) => {
 					editorRef.current = editor;
 					const shapes = editor
