@@ -5,7 +5,7 @@ import {
 	T,
 	createShapeId,
 	type TLBaseShape,
-	type TLComponents,
+	type TLUiComponents,
 	useEditor,
 } from "tldraw";
 import "tldraw/tldraw.css";
@@ -38,6 +38,28 @@ const localHostUrl = "http://127.0.0.1:5000";
 const serverURL = "https://server-flax-ten-71.vercel.app";
 
 const baseUrl = import.meta.env.DEV ? localHostUrl : serverURL;
+
+// Strip the default UI down to just the menu bar with quick actions + page controls
+const MINIMAL_UI: TLUiComponents = {
+	Toolbar: null,
+	StylePanel: null,
+	NavigationPanel: null,
+	ZoomMenu: null,
+	HelpMenu: null,
+	Minimap: null,
+	ContextMenu: null,
+	KeyboardShortcutsDialog: null,
+	DebugPanel: null,
+	DebugMenu: null,
+	HelperButtons: null,
+	RichTextToolbar: null,
+	ImageToolbar: null,
+	VideoToolbar: null,
+	SharePanel: null,
+	TopPanel: null,
+	CursorChatBubble: null,
+	FollowingIndicator: null,
+};
 
 // Z-order normalization: ensure iframes above arrows
 let normalizeRaf: number | null = null;
@@ -1016,17 +1038,14 @@ export default function App() {
 			? {
 					x: viewportBounds.x + viewportBounds.w / 2,
 					y: viewportBounds.y + viewportBounds.h / 2,
-				}
+			  }
 			: {
 					x: 200 + IFRAME_W / 2,
 					y: 200 + IFRAME_H / 2,
-				};
+			  };
 
 		const intersects = (a: any, b: any) =>
-			a.x < b.x + b.w &&
-			a.x + a.w > b.x &&
-			a.y < b.y + b.h &&
-			a.y + a.h > b.y;
+			a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 
 		const visibleFrames =
 			viewportBounds === null
@@ -1056,7 +1075,7 @@ export default function App() {
 				? {
 						x: (clusterBox.minX + clusterBox.maxX) / 2,
 						y: (clusterBox.minY + clusterBox.maxY) / 2,
-					}
+				  }
 				: viewportCenter;
 
 		const clampToViewport = (pos: { x: number; y: number }) => {
@@ -1420,8 +1439,8 @@ export default function App() {
 				licenseKey="tldraw-2026-01-06/WyJDQWNfSnlQRSIsWyIqIl0sMTYsIjIwMjYtMDEtMDYiXQ.jffxTKOc24XLz+ij+h5MATFy3tQb0YwQiZGh8Kjino9R1d6pkah7Wm/7Fudq4ac0ruj81ofGDy75u9gCl8OPCg"
 				persistenceKey="example"
 				shapeUtils={[IframeShapeUtil, WikiSearchShapeUtil]}
-				components={minimalComponents}
-				options={{ actionShortcutsLocation: "toolbar" }}
+				components={MINIMAL_UI}
+				options={{ actionShortcutsLocation: "menu" }}
 				onMount={(editor) => {
 					editorRef.current = editor;
 					const shapes = editor
