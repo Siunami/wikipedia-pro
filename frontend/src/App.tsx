@@ -26,6 +26,8 @@ const SEARCH_BAR_H = 52; // compact height (just the bar)
 const RESULT_ROW_H = 40; // button row height
 const RESULTS_MAX_H = 360; // cap for results area
 
+type BoundsLike = { x: number; y: number; w: number; h: number };
+
 // Guarded diagnostics for deletion flow
 const DEBUG_DELETE_ARROWS = false;
 
@@ -69,6 +71,31 @@ function scheduleNormalizeZOrder(editor: any) {
 		normalizeTimeout = null;
 		doNormalizeZOrder(editor);
 	}, 80);
+}
+
+function focusBounds(
+	editor: any,
+	bounds: BoundsLike,
+	options: { minZoom?: number; maxZoom?: number; bump?: number; duration?: number } = {}
+) {
+	const { minZoom = 1.1, maxZoom = 2.6, bump = 1.25, duration = 260 } = options;
+	if (!editor) return;
+
+	const currentZoom =
+		typeof editor.getZoomLevel === "function" ? editor.getZoomLevel() : 1;
+	const zoomBase = Math.max(currentZoom, minZoom);
+	const targetZoom = Math.min(maxZoom, zoomBase * bump);
+
+	try {
+		// @ts-ignore - tldraw accepts plain bounds objects
+		editor.zoomToBounds(bounds, { targetZoom, animation: { duration } });
+	} catch {
+		try {
+			const cx = bounds.x + bounds.w / 2;
+			const cy = bounds.y + bounds.h / 2;
+			editor.setCamera?.({ x: cx, y: cy, z: targetZoom });
+		} catch {}
+	}
 }
 
 function linkArrowToFrame(frameId: string, arrowId: string) {
@@ -539,10 +566,12 @@ class WikiSearchShapeUtil extends BaseBoxShapeUtil<WikiSearchShape> {
 			});
 			scheduleNormalizeZOrder(editor);
 			const b = { x, y, w: IFRAME_W, h: IFRAME_H };
-			const currentZoom = editor.getZoomLevel ? editor.getZoomLevel() : 1;
-			const targetZoom = Math.min(Math.max(currentZoom, 0.5) * 1.12, 2);
-			// @ts-ignore
-			editor.zoomToBounds(b, { targetZoom, animation: { duration: 240 } });
+			focusBounds(editor, b, {
+				minZoom: 1.2,
+				bump: 1.3,
+				maxZoom: 2.6,
+				duration: 260,
+			});
 			editor.deleteShapes([shape.id] as any);
 		};
 
@@ -1445,14 +1474,11 @@ export default function App() {
 							scheduleNormalizeZOrder(editor);
 
 							const b = { x: pageX, y: pageY, w: SEARCH_W, h: SEARCH_BAR_H };
-							const currentZoom = editor.getZoomLevel
-								? editor.getZoomLevel()
-								: 1;
-							const targetZoom = Math.min(Math.max(currentZoom, 0.5) * 1.12, 2);
-							// @ts-ignore
-							editor.zoomToBounds(b, {
-								targetZoom,
-								animation: { duration: 240 },
+							focusBounds(editor, b, {
+								minZoom: 1.2,
+								bump: 1.35,
+								maxZoom: 2.6,
+								duration: 260,
 							});
 						} catch {}
 					};
