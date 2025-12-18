@@ -245,7 +245,7 @@ class IframeShapeUtil extends BaseBoxShapeUtil<IframeShape> {
 		return {
 			w: IFRAME_W,
 			h: IFRAME_H,
-			url: `${baseUrl}/m?path=/wiki/The_Simpsons`,
+			url: `${baseUrl}/m?path=/wiki/Iannis_Xenakis`,
 		};
 	}
 
