@@ -5,10 +5,11 @@ import {
 	T,
 	createShapeId,
 	type TLBaseShape,
+	type TLComponents,
 	useEditor,
 } from "tldraw";
 import "tldraw/tldraw.css";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 // Map a child window (iframe contentWindow) back to the shape id that hosts it
 const contentWindowToShapeId = new Map<Window, string>();
@@ -245,7 +246,7 @@ class IframeShapeUtil extends BaseBoxShapeUtil<IframeShape> {
 		return {
 			w: IFRAME_W,
 			h: IFRAME_H,
-			url: `${baseUrl}/m?path=/wiki/The_Simpsons`,
+			url: `${baseUrl}/m?path=/wiki/Iannis_Xenakis`,
 		};
 	}
 
@@ -924,6 +925,30 @@ function WikipediaSearchBar({
 
 export default function App() {
 	const editorRef = useRef<any>(null);
+	const minimalComponents = useMemo<TLComponents>(
+		() => ({
+			Toolbar: null,
+			StylePanel: null,
+			NavigationPanel: null,
+			HelperButtons: null,
+			Minimap: null,
+			ZoomMenu: null,
+			ActionsMenu: null,
+			QuickActions: null,
+			PageMenu: null,
+			SharePanel: null,
+			TopPanel: null,
+			CursorChatBubble: null,
+			FollowingIndicator: null,
+			RichTextToolbar: null,
+			ImageToolbar: null,
+			VideoToolbar: null,
+			HelpMenu: null,
+			DebugPanel: null,
+			DebugMenu: null,
+		}),
+		[]
+	);
 
 	// Add this function to find an empty space and create a new iframe
 	const createIframeInEmptySpace = (url: string) => {
@@ -1215,10 +1240,16 @@ export default function App() {
 
 	return (
 		<div style={{ position: "fixed", inset: 0 }}>
+			<WikipediaSearchBar
+				baseUrl={baseUrl}
+				onSelectResult={(url) => createIframeInEmptySpace(url)}
+			/>
 			<Tldraw
 				licenseKey="tldraw-2026-01-06/WyJDQWNfSnlQRSIsWyIqIl0sMTYsIjIwMjYtMDEtMDYiXQ.jffxTKOc24XLz+ij+h5MATFy3tQb0YwQiZGh8Kjino9R1d6pkah7Wm/7Fudq4ac0ruj81ofGDy75u9gCl8OPCg"
 				persistenceKey="example"
 				shapeUtils={[IframeShapeUtil, WikiSearchShapeUtil]}
+				components={minimalComponents}
+				options={{ actionShortcutsLocation: "toolbar" }}
 				onMount={(editor) => {
 					editorRef.current = editor;
 					const shapes = editor
