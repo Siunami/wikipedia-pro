@@ -948,30 +948,6 @@ function WikipediaSearchBar({
 
 export default function App() {
 	const editorRef = useRef<any>(null);
-	const minimalComponents = useMemo<TLComponents>(
-		() => ({
-			Toolbar: null,
-			StylePanel: null,
-			NavigationPanel: null,
-			HelperButtons: null,
-			Minimap: null,
-			ZoomMenu: null,
-			ActionsMenu: null,
-			QuickActions: null,
-			PageMenu: null,
-			SharePanel: null,
-			TopPanel: null,
-			CursorChatBubble: null,
-			FollowingIndicator: null,
-			RichTextToolbar: null,
-			ImageToolbar: null,
-			VideoToolbar: null,
-			HelpMenu: null,
-			DebugPanel: null,
-			DebugMenu: null,
-		}),
-		[]
-	);
 
 	// Add this function to find an empty space and create a new iframe
 	const createIframeInEmptySpace = (url: string) => {
@@ -1285,20 +1261,45 @@ export default function App() {
 
 			const href = (data as any).href as string;
 
-			// normalize to absolute wikipedia mobile URL if needed
-			const normalizedHref = href.startsWith("http")
-				? href
-				: `https://en.m.wikipedia.org${href.startsWith("/") ? "" : "/"}${href}`;
+			let proxied = "";
 
-			// Check if URL is already proxied (either relative /m or absolute including baseUrl)
-			const isAlreadyProxied =
-				normalizedHref.startsWith("/m") ||
-				normalizedHref.includes("/m?url=") ||
-				normalizedHref.includes("/m?path=");
+			// If the iframe sends a proxy-relative URL, keep it on our own origin.
+			if (
+				href.startsWith("/m") ||
+				href.startsWith("/i") ||
+				href.startsWith("/static/")
+			) {
+				let origin = baseUrl;
+				try {
+					origin = new URL(baseUrl).origin;
+				} catch {}
+				proxied = `${origin}${href}`;
+			} else {
+				// Keep already-proxied absolute URLs on our own origin (avoid nesting /m?url=...).
+				let isAlreadyProxiedAbsolute = false;
+				try {
+					const u = new URL(href);
+					const base = new URL(baseUrl);
+					isAlreadyProxiedAbsolute =
+						u.origin === base.origin &&
+						u.pathname === "/m" &&
+						(u.searchParams.has("url") || u.searchParams.has("path"));
+				} catch {}
 
-			const proxied = isAlreadyProxied
-				? normalizedHref
-				: `${baseUrl}/m?url=${encodeURIComponent(normalizedHref)}`;
+				// Otherwise normalize to an absolute Wikipedia mobile URL and proxy it.
+				const normalizedHref = href.startsWith("http")
+					? href
+					: `https://en.m.wikipedia.org${
+							href.startsWith("/") ? "" : "/"
+					  }${href}`;
+				const mobileNormalized = normalizedHref.replace(
+					"en.wikipedia.org",
+					"en.m.wikipedia.org"
+				);
+				proxied = isAlreadyProxiedAbsolute
+					? href
+					: `${baseUrl}/m?url=${encodeURIComponent(mobileNormalized)}`;
+			}
 
 			const fromWin = e.source as Window | null;
 			const hintedId = (data as any).sourceId as string | undefined;
@@ -1450,6 +1451,29 @@ export default function App() {
 						// @ts-ignore
 						const u = s.props?.url as string | undefined;
 						if (u && /^https?:\/\//.test(u)) {
+							let isAlreadyProxied = false;
+							try {
+								const uu = new URL(u);
+								const base = new URL(baseUrl);
+								isAlreadyProxied =
+									uu.origin === base.origin &&
+									uu.pathname === "/m" &&
+									(uu.searchParams.has("url") || uu.searchParams.has("path"));
+							} catch {
+								isAlreadyProxied =
+									u.includes("/m?url=") || u.includes("/m?path=");
+							}
+
+							if (isAlreadyProxied) {
+								// Already normalized; just ensure consistent dimensions
+								editor.updateShape({
+									id: s.id,
+									type: "iframe",
+									props: { w: IFRAME_W, h: IFRAME_H },
+								});
+								continue;
+							}
+
 							editor.updateShape({
 								id: s.id,
 								type: "iframe",

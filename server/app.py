@@ -1,14 +1,181 @@
+from __future__ import annotations
+
 from flask import Flask, request, Response, redirect
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse, quote, parse_qs
+from urllib.parse import urljoin, urlparse, quote, parse_qs, unquote
 import os
+import hashlib
+from datetime import datetime, timedelta, timezone
+
+try:
+    from supabase import create_client
+except Exception:
+    create_client = None
 
 # Create a Flask app without serving static files from this app (we proxy Wikipedia's instead)
 app = Flask(__name__, static_folder=None)
 
 # Base domain for the mobile Wikipedia experience; configurable via env
 WIKI_BASE = os.environ.get("WIKI_BASE", "https://en.m.wikipedia.org")
+
+# Optional Supabase-backed HTML cache (safe to run without Supabase configured)
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+WIKI_CACHE_TABLE = os.environ.get("WIKI_CACHE_TABLE", "wiki_html_cache")
+
+# Bump this when you change rewrite behavior to effectively bust the cache
+CACHE_REWRITE_VERSION = int(os.environ.get("CACHE_REWRITE_VERSION", "1"))
+
+# Adaptive TTL defaults (seconds)
+CACHE_TTL_MIN_SECONDS = int(os.environ.get("CACHE_TTL_MIN_SECONDS", "600"))  # 10m
+CACHE_TTL_MAX_SECONDS = int(os.environ.get("CACHE_TTL_MAX_SECONDS", "86400"))  # 24h
+CACHE_TTL_GROWTH_FACTOR = float(os.environ.get("CACHE_TTL_GROWTH_FACTOR", "2.0"))
+
+supabase = None
+if create_client and SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    except Exception:
+        supabase = None
+
+# Wikimedia/Wikipedia allowlist (prevents SSRF + avoids caching arbitrary hosts)
+_WIKIMEDIA_APEX = (
+    "wikipedia.org",
+    "wiktionary.org",
+    "wikidata.org",
+    "wikimedia.org",
+    "wikibooks.org",
+    "wikiquote.org",
+    "wikiversity.org",
+    "wikivoyage.org",
+    "wikisource.org",
+    "wikinews.org",
+    "mediawiki.org",
+)
+
+
+def is_allowed_wikimedia_host(host: str) -> bool:
+    if not host:
+        return False
+    h = host.lower().strip()
+    # Strip port if present
+    if ":" in h:
+        h = h.split(":", 1)[0]
+    if h in ("commons.wikimedia.org", "upload.wikimedia.org"):
+        return True
+    for apex in _WIKIMEDIA_APEX:
+        if h == apex or h.endswith("." + apex):
+            return True
+    return False
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def to_iso8601_z(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace("+00:00", "Z")
+
+
+def parse_iso8601(dt_str: str | None) -> datetime | None:
+    if not dt_str:
+        return None
+    s = dt_str.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def lang_key_from_accept_language(header_val: str | None) -> str:
+    if not header_val:
+        return "en"
+    first = header_val.split(",", 1)[0].strip()
+    if not first:
+        return "en"
+    tag = first.split(";", 1)[0].strip().lower()
+    return tag or "en"
+
+
+def canonicalize_url_for_cache(url: str) -> str:
+    try:
+        p = urlparse(url)
+        return p._replace(fragment="").geturl()
+    except Exception:
+        return url
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def compute_cache_key(url: str, lang_key: str) -> str:
+    canonical = canonicalize_url_for_cache(url)
+    material = f"v{CACHE_REWRITE_VERSION}|{lang_key}|{canonical}"
+    return sha256_hex(material)
+
+
+def is_cacheable_html_target(parsed) -> bool:
+    """Heuristic to avoid DB lookups for obvious asset URLs."""
+    path = (parsed.path or "").strip()
+    if path == "" or path == "/":
+        return True
+    if path.startswith("/wiki/"):
+        return True
+    if path == "/w/index.php":
+        return True
+    return False
+
+
+def next_ttl_seconds(current_ttl_seconds: int | None, can_grow: bool) -> int:
+    if not can_grow:
+        return CACHE_TTL_MIN_SECONDS
+    cur = current_ttl_seconds or 0
+    if cur <= 0:
+        cur = CACHE_TTL_MIN_SECONDS
+    grown = int(cur * CACHE_TTL_GROWTH_FACTOR)
+    if grown <= cur:
+        grown = cur + CACHE_TTL_MIN_SECONDS
+    if grown < CACHE_TTL_MIN_SECONDS:
+        grown = CACHE_TTL_MIN_SECONDS
+    if grown > CACHE_TTL_MAX_SECONDS:
+        grown = CACHE_TTL_MAX_SECONDS
+    return grown
+
+
+def cache_get(cache_key: str) -> dict | None:
+    if not supabase:
+        return None
+    try:
+        resp = (
+            supabase.table(WIKI_CACHE_TABLE)
+            .select("*")
+            .eq("cache_key", cache_key)
+            .limit(1)
+            .execute()
+        )
+        data = getattr(resp, "data", None) or []
+        if not data:
+            return None
+        return data[0]
+    except Exception:
+        return None
+
+
+def cache_upsert(row: dict) -> None:
+    if not supabase:
+        return
+    try:
+        supabase.table(WIKI_CACHE_TABLE).upsert(row).execute()
+    except Exception:
+        # Cache failures should never break page rendering
+        return
 
 
 def absolutize(url_or_path: str) -> str:
@@ -332,9 +499,63 @@ def unwrap_proxy_url(url: str) -> str:
         # Compare against the host that handled this request
         # NOTE: request.host originates from the Host header; behind proxies this can vary.
         if p.netloc != request.host:
-            break
+            # Allow common local dev host aliases (localhost vs 127.0.0.1) with same port
+            try:
+
+                def _split_netloc(netloc: str):
+                    nl = netloc.strip()
+                    if nl.startswith("["):
+                        # IPv6: [::1]:5000
+                        host_part, _, rest = nl[1:].partition("]")
+                        port_part = None
+                        if rest.startswith(":"):
+                            port_part = rest[1:]
+                        return host_part, port_part
+                    if ":" in nl:
+                        h, p2 = nl.rsplit(":", 1)
+                        return h, p2
+                    return nl, None
+
+                a_host, a_port = _split_netloc(p.netloc or "")
+                b_host, b_port = _split_netloc(request.host or "")
+                loopbacks = {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+                if not (
+                    (a_port == b_port)
+                    and (a_host.lower() in loopbacks)
+                    and (b_host.lower() in loopbacks)
+                ):
+                    break
+            except Exception:
+                break
         path = p.path or ""
+        # Some callers accidentally double-encode the query string, e.g. "url%3Dhttps%253A..."
+        # In that case parse_qs won't see the url/path params. Try to decode once and re-parse.
         qs = parse_qs(p.query or "")
+        if (
+            ("url" not in qs and "path" not in qs)
+            and p.query
+            and ("%3D" in p.query or "%26" in p.query)
+        ):
+            try:
+                decoded_q = unquote(p.query)
+                qs2 = parse_qs(decoded_q or "")
+                if "url" in qs2 or "path" in qs2:
+                    qs = qs2
+            except Exception:
+                pass
+        # Rare case: query parsed as a single key containing "url=<...>" because '=' was encoded
+        if ("url" not in qs and "path" not in qs) and len(qs) == 1:
+            only_key = next(iter(qs.keys()))
+            if isinstance(only_key, str) and (
+                "url=" in only_key or "path=" in only_key
+            ):
+                try:
+                    if only_key.startswith("url="):
+                        qs = {"url": [only_key.split("=", 1)[1]]}
+                    elif only_key.startswith("path="):
+                        qs = {"path": [only_key.split("=", 1)[1]]}
+                except Exception:
+                    pass
         if path == "/m":
             inner = qs.get("url", [None])[0]
             if inner:
@@ -387,15 +608,152 @@ def mobile():
     parsed = urlparse(target)
     if parsed.scheme not in ("http", "https"):
         return Response("Invalid scheme.", status=400)
+    # Prevent SSRF / caching arbitrary hosts
+    if not is_allowed_wikimedia_host(parsed.netloc):
+        return Response("Host not allowed.", status=403)
 
-    # Fetch from upstream with browser-like headers to mimic a real browser
-    headers = {
+    lang_key = lang_key_from_accept_language(request.headers.get("Accept-Language"))
+    canonical_target = canonicalize_url_for_cache(target)
+
+    # Fetch from upstream with browser-like headers to mimic a real browser.
+    # Prefer the client's Accept header so asset requests (css/js) behave correctly.
+    upstream_headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept": request.headers.get(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        ),
         "Accept-Language": request.headers.get("Accept-Language", "en-US,en;q=0.9"),
     }
+
+    now = utcnow()
+    wants_cache = bool(supabase) and is_cacheable_html_target(parsed)
+    cache_key = compute_cache_key(canonical_target, lang_key) if wants_cache else None
+    entry = cache_get(cache_key) if (wants_cache and cache_key) else None
+
+    def html_response(body: str, status: int, cache_state: str | None = None):
+        headers = {
+            "Content-Type": "text/html; charset=utf-8",
+            "Cache-Control": "no-store",
+        }
+        if cache_state:
+            headers["X-WikiPro-Cache"] = cache_state
+        return Response(body, status=status, headers=headers)
+
+    # Fresh cache hit
+    if entry and entry.get("body") and entry.get("next_refresh_at"):
+        next_refresh = parse_iso8601(entry.get("next_refresh_at"))
+        if next_refresh and now < next_refresh:
+            return html_response(
+                entry.get("body") or "",
+                int(entry.get("status") or 200),
+                "HIT",
+            )
+
+    # Stale cache entry → conditional revalidate (serve stale on error)
+    if entry and entry.get("body"):
+        conditional_headers = dict(upstream_headers)
+        if entry.get("etag"):
+            conditional_headers["If-None-Match"] = entry.get("etag")
+        if entry.get("last_modified"):
+            conditional_headers["If-Modified-Since"] = entry.get("last_modified")
+
+        try:
+            resp = requests.get(target, headers=conditional_headers, timeout=15)
+        except requests.RequestException:
+            # Can't reach upstream; serve stale cache
+            return html_response(
+                entry.get("body") or "",
+                int(entry.get("status") or 200),
+                "STALE",
+            )
+
+        content_type = resp.headers.get("Content-Type", "")
+
+        # Upstream unchanged
+        if resp.status_code == 304:
+            cached_status = int(entry.get("status") or 200)
+            can_grow = cached_status == 200
+            ttl = next_ttl_seconds(entry.get("ttl_seconds"), can_grow=can_grow)
+            next_refresh_at = now + timedelta(seconds=ttl)
+
+            row = {
+                "cache_key": cache_key,
+                "url": canonical_target,
+                "lang_key": lang_key,
+                "rewrite_version": CACHE_REWRITE_VERSION,
+                "status": cached_status,
+                "content_type": entry.get("content_type") or "text/html; charset=utf-8",
+                "body": entry.get("body") or "",
+                "body_sha256": entry.get("body_sha256")
+                or sha256_hex(entry.get("body") or ""),
+                "etag": resp.headers.get("ETag") or entry.get("etag"),
+                "last_modified": resp.headers.get("Last-Modified")
+                or entry.get("last_modified"),
+                "ttl_seconds": ttl,
+                "next_refresh_at": to_iso8601_z(next_refresh_at),
+                "fetched_at": entry.get("fetched_at") or to_iso8601_z(now),
+                "last_checked_at": to_iso8601_z(now),
+                "last_changed_at": entry.get("last_changed_at")
+                or (entry.get("fetched_at") or to_iso8601_z(now)),
+            }
+            cache_upsert(row)
+            return html_response(entry.get("body") or "", cached_status, "REVALIDATED")
+
+        # If it isn't HTML, just stream it through unchanged (don't cache in DB)
+        if "text/html" not in content_type:
+            return Response(
+                resp.content,
+                status=resp.status_code,
+                headers={
+                    "Content-Type": content_type or "application/octet-stream",
+                    "Cache-Control": "no-store",
+                },
+            )
+
+        replaced = rewrite_links(resp.text, base_url=target)
+        body_hash = sha256_hex(replaced)
+        cached_hash = entry.get("body_sha256")
+        unchanged = (
+            resp.status_code == 200
+            and int(entry.get("status") or 0) == 200
+            and bool(cached_hash)
+            and body_hash == cached_hash
+        )
+        ttl = next_ttl_seconds(entry.get("ttl_seconds"), can_grow=unchanged)
+        if not unchanged:
+            ttl = CACHE_TTL_MIN_SECONDS
+        next_refresh_at = now + timedelta(seconds=ttl)
+
+        row = {
+            "cache_key": cache_key,
+            "url": canonical_target,
+            "lang_key": lang_key,
+            "rewrite_version": CACHE_REWRITE_VERSION,
+            "status": int(resp.status_code),
+            "content_type": "text/html; charset=utf-8",
+            "body": replaced,
+            "body_sha256": body_hash,
+            "etag": resp.headers.get("ETag"),
+            "last_modified": resp.headers.get("Last-Modified"),
+            "ttl_seconds": ttl,
+            "next_refresh_at": to_iso8601_z(next_refresh_at),
+            "fetched_at": to_iso8601_z(now),
+            "last_checked_at": to_iso8601_z(now),
+            "last_changed_at": (
+                entry.get("last_changed_at") if unchanged else to_iso8601_z(now)
+            ),
+        }
+        cache_upsert(row)
+        return html_response(
+            replaced,
+            int(resp.status_code),
+            "UNCHANGED" if unchanged else "REFRESH",
+        )
+
+    # Cache miss (or cache disabled): fetch normally
     try:
-        resp = requests.get(target, headers=headers, timeout=15)
+        resp = requests.get(target, headers=upstream_headers, timeout=15)
     except requests.RequestException as e:
         # Upstream network/timeout error → 502 Bad Gateway
         return Response(f"Upstream fetch error: {e}", status=502)
@@ -413,16 +771,33 @@ def mobile():
             },
         )
 
-    # For HTML responses, rewrite links to route back through this proxy and inject our script
     replaced = rewrite_links(resp.text, base_url=target)
 
-    return Response(
-        replaced,
-        status=resp.status_code,
-        headers={
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-        },
+    # Store new entry with MIN TTL
+    if wants_cache and cache_key:
+        ttl = CACHE_TTL_MIN_SECONDS
+        next_refresh_at = now + timedelta(seconds=ttl)
+        row = {
+            "cache_key": cache_key,
+            "url": canonical_target,
+            "lang_key": lang_key,
+            "rewrite_version": CACHE_REWRITE_VERSION,
+            "status": int(resp.status_code),
+            "content_type": "text/html; charset=utf-8",
+            "body": replaced,
+            "body_sha256": sha256_hex(replaced),
+            "etag": resp.headers.get("ETag"),
+            "last_modified": resp.headers.get("Last-Modified"),
+            "ttl_seconds": ttl,
+            "next_refresh_at": to_iso8601_z(next_refresh_at),
+            "fetched_at": to_iso8601_z(now),
+            "last_checked_at": to_iso8601_z(now),
+            "last_changed_at": to_iso8601_z(now),
+        }
+        cache_upsert(row)
+
+    return html_response(
+        replaced, int(resp.status_code), "MISS" if wants_cache else None
     )
 
 
@@ -471,6 +846,8 @@ def proxy_image():
     parsed = urlparse(raw_url)
     if parsed.scheme not in ("http", "https"):
         return Response("Invalid scheme", status=400)
+    if not is_allowed_wikimedia_host(parsed.netloc):
+        return Response("Host not allowed", status=403)
 
     headers = {
         "User-Agent": "wikipedia-proxy/0.1 (+https://example.local)",
