@@ -588,6 +588,7 @@ class WikiSearchShapeUtil extends BaseBoxShapeUtil<WikiSearchShape> {
 						inset: 0,
 						display: "flex",
 						flexDirection: "column",
+						justifyContent: isOpen ? "flex-start" : "center",
 						background: "#fefefe",
 						borderRadius: 8,
 						overflow: "hidden",
